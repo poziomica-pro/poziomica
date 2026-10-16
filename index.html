@@ -20,7 +20,7 @@ html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans
 body{min-height:100vh}
 button{font-family:inherit;cursor:pointer}
 button:disabled{opacity:.38;cursor:default}
-#app{max-width:480px;margin:0 auto;padding:calc(env(safe-area-inset-top) + 14px) 16px calc(env(safe-area-inset-bottom) + 84px);display:flex;flex-direction:column;gap:12px}
+#app{max-width:480px;margin:0 auto;padding:calc(env(safe-area-inset-top) + 14px) 16px calc(env(safe-area-inset-bottom) + 120px);display:flex;flex-direction:column;gap:12px}
 .row{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .h1{font-size:22px;font-weight:700}
 .sub{font-size:13px;color:var(--muted)}
@@ -95,9 +95,9 @@ function parseS(line) {             // S,t,x,y,temp,gotowe,niep,V,okno,powrot,na
   return { t: +a[1], x: +a[2], y: +a[3], temp: +a[4], stable: a[5] === '1', spread: +a[6], volt: +a[7],
            win: +a[8], ret: a[9] === '1', next: +a[10], nTam: +a[11], sd: +a[12], done: a[13] === '1' };
 }
-function parseI(line) {             // I,fw,zx,zy,kx,ky,zt,ktx,kty,dzwiek,karta,plik,okno
+function parseI(line) {             // I,fw,zx,zy,kx,ky,zt,ktx,kty,dzwiek,karta,plik,okno,krok_um
   const a = line.split(',');
-  return { fw: a[1], zx: +a[2], zy: +a[3], kx: +a[4], ky: +a[5], zt: +a[6], ktx: +a[7], kty: +a[8],
+  return { res: +a[13] || 5, fw: a[1], zx: +a[2], zy: +a[3], kx: +a[4], ky: +a[5], zt: +a[6], ktx: +a[7], kty: +a[8],
            sound: a[9] === '1', sd: +a[10], file: a[11], win: +a[12] };
 }
 
@@ -190,11 +190,25 @@ function calcSens(a1, b, a2, axis, h, L, kOld) {
 }
 
 // jednostki
-const UNITS = { mmm: { f: 1, d: 3, l: 'mm/m' }, umm: { f: 1000, d: 1, l: 'µm/m' }, sec: { f: 206.265, d: 2, l: '″' } };
+// krok wyswietlania 0,005 mm/m (= 5 µm/m, ok. 1″) - mniejsze roznice to szum czujnika
+const UNITS = { mmm: { f: 1, d: 3, l: 'mm/m' }, umm: { f: 1000, d: 0, l: 'µm/m' }, sec: { f: 206.265, d: 0, l: '″' } };
+let RES = 0.005;                    // krok wyswietlania w mm/m: 0,005 albo 0,001
+function unitStep(unit) { const u = UNITS[unit] || UNITS.mmm; return unit === 'sec' ? (RES >= 0.005 ? 1 : 0.2) : RES * u.f; }
+function unitDec(unit) { return unit === 'sec' ? (RES >= 0.005 ? 0 : 1) : (UNITS[unit] || UNITS.mmm).d; }
+// histereza: nowa wartosc dopiero gdy odczyt odejdzie o 0,7 kroku od pokazywanej
+const shown = {};
+function hyst(key, v) {
+  const p = shown[key];
+  if (!p || p.res !== RES || Math.abs(v - p.v) > 0.7 * RES) shown[key] = { v: Math.round(v / RES) * RES, res: RES };
+  return shown[key].v;
+}
 function fmt(v, unit, sign = true) {
   if (v === null || v === undefined || isNaN(v)) return '–';
   const u = UNITS[unit] || UNITS.mmm;
-  let s = Math.abs(v * u.f).toFixed(u.d).replace('.', ',');
+  const step = unitStep(unit);
+  const r = Math.round(v * u.f / step) * step;
+  let s = Math.abs(r).toFixed(unitDec(unit)).replace('.', ',');
+  if (!/[1-9]/.test(s)) return s;                  // po zaokragleniu zero: bez znaku
   if (!sign) return (v < 0 ? '−' : '') + s;
   return (v < 0 ? '−' : '+') + s;
 }
@@ -217,10 +231,11 @@ function seriesCsv(res, points) {
   for (const p of points) L.push(['P' + p.idx, p.dir, p.t, n(p.x), n(p.y), n(p.temp), n(p.stab)].join(';'));
   return L.join('\r\n') + '\r\n';
 }
-if (typeof module !== 'undefined') module.exports = { parseP, parseS, parseI, analyze, calcABA, calcSens, fmt, seriesCsv, niceScale };
+if (typeof module !== 'undefined') module.exports = { hyst, setRes: v => { RES = v; }, parseP, parseS, parseI, analyze, calcABA, calcSens, fmt, seriesCsv, niceScale };
 </script>
 
 <script>
+const APP_VERSION = '04.3';
 // ===== Bluetooth (Nordic UART) =====
 const NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
@@ -232,7 +247,7 @@ const st = {
   tab: 'pomiar', unit: 'mmm', axis: 'x', showT: true,
   buf: '', dl: null, qWait: null, toastTimer: null
 };
-try { st.unit = localStorage.getItem('poz_unit') || 'mmm'; } catch (e) {}
+try { st.unit = localStorage.getItem('poz_unit') || 'mmm'; RES = localStorage.getItem('poz_res') === '0.001' ? 0.001 : 0.005; } catch (e) {}
 
 let writeChain = Promise.resolve();
 function send(cmd) {
@@ -244,28 +259,56 @@ function send(cmd) {
   return writeChain;
 }
 
+async function setupGatt(dev) {
+  const server = await dev.gatt.connect();
+  const svc = await server.getPrimaryService(NUS);
+  st.rx = await svc.getCharacteristic(NUS_RX);
+  const tx = await svc.getCharacteristic(NUS_TX);
+  tx.addEventListener('characteristicvaluechanged', ev => onData(new TextDecoder().decode(ev.target.value)));
+  await tx.startNotifications();
+  st.connected = true; st.points = []; st.buf = ''; st.dl = null;
+  writeChain = Promise.resolve();
+  await send(RES === 0.001 ? 'H' : 'G'); await send('i'); await send('L');
+  wakeOn();
+}
+
 async function connect() {
   if (!navigator.bluetooth) { toast('Ta przeglądarka nie obsługuje Bluetooth. Otwórz stronę w aplikacji Bluefy.'); return; }
   try {
-    st.connecting = true; render();
+    st.connecting = true; st.userDisc = false; render();
     const dev = await navigator.bluetooth.requestDevice({ filters: [{ name: 'Poziomica' }, { services: [NUS] }], optionalServices: [NUS] });
+    if (st.dev !== dev) dev.addEventListener('gattserverdisconnected', onDisconnect);
     st.dev = dev;
-    dev.addEventListener('gattserverdisconnected', onDisconnect);
-    const server = await dev.gatt.connect();
-    const svc = await server.getPrimaryService(NUS);
-    st.rx = await svc.getCharacteristic(NUS_RX);
-    const tx = await svc.getCharacteristic(NUS_TX);
-    tx.addEventListener('characteristicvaluechanged', ev => onData(new TextDecoder().decode(ev.target.value)));
-    await tx.startNotifications();
-    st.connected = true; st.points = []; st.buf = '';
-    await send('i'); await send('L');
+    await setupGatt(dev);
   } catch (e) {
     if (e.name !== 'NotFoundError') toast('Nie udało się połączyć: ' + e.message);
   }
   st.connecting = false; render();
 }
-function disconnect() { if (st.dev && st.dev.gatt.connected) st.dev.gatt.disconnect(); }
-function onDisconnect() { st.connected = false; st.rx = null; st.s = null; st.dl = null; render(); toast('Rozłączono z poziomicą'); }
+function disconnect() { st.userDisc = true; if (st.dev && st.dev.gatt.connected) st.dev.gatt.disconnect(); }
+
+// po zerwaniu polaczenia: sama laczy sie ponownie (bez wybierania z listy)
+async function onDisconnect() {
+  st.connected = false; st.rx = null; st.s = null; st.dl = null;
+  if (st.qWait) { clearTimeout(st.qWait.timer); st.qWait.reject(new Error('rozlaczono')); st.qWait = null; }
+  st.drops = (st.drops || 0) + 1;
+  if (st.userDisc || !st.dev) { render(); toast('Rozłączono z poziomicą'); return; }
+  st.reconnecting = true; render();
+  for (let i = 0; i < 8 && !st.userDisc; i++) {
+    await new Promise(r => setTimeout(r, i === 0 ? 300 : 1500));
+    try { await setupGatt(st.dev); break; } catch (e) { /* kolejna proba */ }
+  }
+  st.reconnecting = false;
+  if (!st.connected && !st.userDisc) toast('Nie udało się połączyć ponownie – naciśnij Połącz');
+  render();
+}
+
+// ekran telefonu nie gasnie, gdy aplikacja jest polaczona
+let wakeLock = null;
+async function wakeOn() {
+  try { if ('wakeLock' in navigator && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && st.connected) wakeOn(); });
 
 function onData(chunk) {
   st.buf += chunk;
@@ -312,6 +355,7 @@ function onLine(line) {
     updateDl();
   } else if (line.startsWith('# nowa seria') || line.startsWith('# lista punktow')) { st.points = []; render(); }
   else if (line.startsWith('#ERR')) toast(line.slice(5));
+  else if (line.startsWith('# BT')) { /* informacja diagnostyczna z poziomicy */ }
   else if (c === '#' && /UWAGA|niestabilny|zapisan|skasowan|powrot|za malo|zakonczona/.test(line)) toast(line.slice(2));
 }
 
@@ -370,6 +414,7 @@ function renderLive() {
 }
 
 function connPill() {
+  if (st.reconnecting) return `<div class="pill"><span class="dot" style="background:var(--warn)"></span><span>Łączę ponownie…</span></div>`;
   if (!st.connected) return `<button class="btn sm acc" data-act="connect" ${st.connecting ? 'disabled' : ''}>${st.connecting ? 'Łączę…' : 'Połącz'}</button>`;
   const v = st.s ? num(st.s.volt, 2) + ' V' : '…';
   return `<div class="pill"><span class="dot" style="background:var(--ok)"></span><span>Połączono</span><span style="color:var(--faint)">·</span><span class="mono">${v}</span></div>`;
@@ -377,6 +422,7 @@ function connPill() {
 
 function band() {
   const s = st.s;
+  if (st.reconnecting) return `<div class="band wait"><span class="big" style="font-size:17px;letter-spacing:0">Łączę ponownie…</span><small>zerwane połączenie</small></div>`;
   if (!st.connected) return `<div class="band off"><span class="big" style="font-size:17px;letter-spacing:0">Brak połączenia</span><small>naciśnij Połącz</small></div>`;
   if (!s) return `<div class="band off"><span class="big" style="font-size:17px;letter-spacing:0">Czekam na dane…</span></div>`;
   const info = `stabilność ±${s.spread >= 0 ? num(s.spread, 3) : '–'}<br>okno ${s.win} s`;
@@ -441,8 +487,8 @@ function viewPomiar() {
 ${band()}
 ${libella()}
 <div class="grid2">
- <div class="card"><div class="lab">X</div><div class="val">${live ? fmt(s.x, st.unit) : '–'}</div><div class="sub" style="font-size:12px">${u}</div></div>
- <div class="card"><div class="lab">Y</div><div class="val">${live ? fmt(s.y, st.unit) : '–'}</div><div class="sub" style="font-size:12px">${u}</div></div>
+ <div class="card"><div class="lab">X</div><div class="val">${live ? fmt(hyst('x', s.x), st.unit) : '–'}</div><div class="sub" style="font-size:12px">${u}</div></div>
+ <div class="card"><div class="lab">Y</div><div class="val">${live ? fmt(hyst('y', s.y), st.unit) : '–'}</div><div class="sub" style="font-size:12px">${u}</div></div>
 </div>
 <div class="card row" style="padding:10px 14px"><div class="lab">Temperatura</div><div class="row" style="gap:12px;align-items:baseline"><span class="mono" style="font-size:20px;font-weight:600">${live ? num(s.temp, 1) + ' °C' : '–'}</span><span class="mono dim" style="font-size:12px">${live ? tempTrend() : ''}</span></div></div>
 <div class="row" style="gap:10px">
@@ -459,17 +505,19 @@ function chart(res) {
   const vals = [];
   for (const r of rows) { vals.push(r['tam' + k]); if (r['pow' + k] !== null) vals.push(r['pow' + k]); }
   const S = niceScale(Math.max(...vals.map(Math.abs)) * 1.1 || 0.01, [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]);
-  const x0 = 60, x1 = 300, top = 20, mid = 75, bot = 130;
+  const x0 = 72, x1 = 308, top = 20, mid = 75, bot = 130;
   const X = i => rows.length > 1 ? x0 + (x1 - x0) * i / (rows.length - 1) : (x0 + x1) / 2;
   const Y = v => mid - v / S * (mid - top);
-  let g = `<line x1="34" y1="75" x2="320" y2="75" stroke="#3A434C" stroke-width="1.5"/><line x1="34" y1="20" x2="320" y2="20" stroke="#232A31"/><line x1="34" y1="130" x2="320" y2="130" stroke="#232A31"/>
-<text x="30" y="24" fill="#6E7881" font-size="10" text-anchor="end" font-family="IBM Plex Mono">${fmt(S, st.unit)}</text><text x="30" y="79" fill="#6E7881" font-size="10" text-anchor="end" font-family="IBM Plex Mono">0</text><text x="30" y="134" fill="#6E7881" font-size="10" text-anchor="end" font-family="IBM Plex Mono">${fmt(-S, st.unit)}</text>`;
+  let g = `<line x1="50" y1="75" x2="324" y2="75" stroke="#3A434C" stroke-width="1.5"/><line x1="50" y1="20" x2="324" y2="20" stroke="#232A31"/><line x1="50" y1="130" x2="324" y2="130" stroke="#232A31"/>
+<text x="46" y="24" fill="#6E7881" font-size="10" text-anchor="end" font-family="IBM Plex Mono">${fmt(S, st.unit)}</text><text x="46" y="79" fill="#6E7881" font-size="10" text-anchor="end" font-family="IBM Plex Mono">0</text><text x="46" y="134" fill="#6E7881" font-size="10" text-anchor="end" font-family="IBM Plex Mono">${fmt(-S, st.unit)}</text>`;
   if (st.showT) {
     const ts = [];
     rows.forEach((r, i) => { if (!isNaN(r.temp)) ts.push([X(i), r.temp]); });
     if (ts.length) {
-      const lo = Math.min(...ts.map(a => a[1])), hi = Math.max(...ts.map(a => a[1]));
-      const TY = t => hi - lo < 0.005 ? mid : bot - (t - lo) / (hi - lo) * (bot - top);
+      // skala temperatury co najmniej 0,5 C na cala wysokosc - drobne wahania nie wygladaja na duze
+      const lo0 = Math.min(...ts.map(a => a[1])), hi0 = Math.max(...ts.map(a => a[1]));
+      const span = Math.max(hi0 - lo0, 0.5), lo = (lo0 + hi0) / 2 - span / 2;
+      const TY = t => bot - (t - lo) / span * (bot - top);
       g += `<polyline points="${ts.map(a => a[0] + ',' + TY(a[1])).join(' ')}" fill="none" stroke="#F0A3FF" stroke-width="2" stroke-dasharray="2 4" stroke-linecap="round"/>`;
       g += ts.map(a => `<path d="M${a[0]} ${TY(a[1]) - 5}l5 5-5 5-5-5z" fill="#F0A3FF"/>`).join('');
     }
@@ -531,10 +579,12 @@ function viewUstawienia() {
   const kTxt = I ? `X ${num(I.kx, 4)} · Y ${num(I.ky, 4)}` + (I.ktx || I.kty ? ' · ostatnia: ' + dateStr(Math.max(I.ktx, I.kty)) : ' · nie kalibrowana') : 'brak danych';
   const sdTxt = !I ? '–' : I.sd === 0 ? 'brak karty' : I.file + (I.sd === 2 ? ' · zapis włączony' : ' · zapis wstrzymany');
   return `<div class="h1">Ustawienia</div>
-<div class="card row"><div><div style="font-size:15px;font-weight:600">Poziomica${I ? ' · V' + esc(I.fw) : ''}</div><div class="mono dim" style="font-size:12px">${s ? num(s.volt, 2) + ' V · ' + num(s.temp, 1) + ' °C' : c ? 'połączono' : 'niepołączona'}</div></div>
+<div class="card row"><div><div style="font-size:15px;font-weight:600">Poziomica${I ? ' · V' + esc(I.fw) : ''}</div><div class="mono dim" style="font-size:12px">${s ? num(s.volt, 2) + ' V · ' + num(s.temp, 1) + ' °C' : c ? 'połączono' : 'niepołączona'}${st.drops ? ' · zerwań: ' + st.drops : ''}</div></div>
  ${c ? '<button class="btn sm" data-act="disconnect">Rozłącz</button>' : `<button class="btn sm acc" data-act="connect">Połącz</button>`}</div>
 <div style="display:flex;flex-direction:column;gap:6px"><div class="lab">Okno uśredniania</div>${seg([[1, '1 s'], [5, '5 s'], [10, '10 s'], [30, '30 s']], win, 'win')}</div>
 <div style="display:flex;flex-direction:column;gap:6px"><div class="lab">Jednostka</div>${seg([['mmm', 'mm/m'], ['umm', 'µm/m'], ['sec', '″ (sekundy)']], st.unit, 'unit')}</div>
+<div style="display:flex;flex-direction:column;gap:6px"><div class="lab">Rozdzielczość wyświetlania</div>${seg([['0.005', '0,005 mm/m'], ['0.001', '0,001 mm/m']], String(RES), 'res')}
+<div class="sub" style="font-size:12px">0,005 – do regulacji maszyny (szum ukryty) · 0,001 – do analizy serii. Obliczenia i pliki zawsze z pełną dokładnością.</div></div>
 <div class="card list">
  <div class="li"><div><div class="t">Kalibracja zera A-B-A</div><div class="d">A → obrót 180° (B) → A; zero z korektą dryftu · ${zeroTxt}</div></div><button class="btn sm acc" data-act="aba" ${c ? '' : 'disabled'}>Start</button></div>
  <div class="li"><div><div class="t">Kalibracja czułości</div><div class="d">wałek lub płytka wzorcowa o znanej wysokości · ${kTxt}</div></div><button class="btn sm acc" data-act="sens" ${c ? '' : 'disabled'}>Start</button></div>
@@ -544,6 +594,7 @@ function viewUstawienia() {
  <div class="li"><div><div class="t">Karta SD</div><div class="d mono">${esc(sdTxt)}</div></div><div class="row" style="gap:6px"><button class="btn sm" data-act="dlprev" ${c && I && I.sd ? '' : 'disabled'}>Poprz.</button><button class="btn sm" data-act="dl" ${c && I && I.sd ? '' : 'disabled'}>Pobierz</button></div></div>
  <div class="li"><label for="snd" class="t">Dźwięk brzęczyka</label><input id="snd" type="checkbox" data-act="sound" ${I && I.sound ? 'checked' : ''} ${c ? '' : 'disabled'}></div>
 </div>
+<div class="sub" style="font-size:12px;text-align:center">aplikacja ${APP_VERSION}</div>
 ${navigator.bluetooth ? '' : '<div class="warnbox">Ta przeglądarka nie obsługuje Bluetooth. Otwórz tę stronę w aplikacji Bluefy.</div>'}`;
 }
 
@@ -646,6 +697,7 @@ document.addEventListener('click', async ev => {
   if (d.tab) { st.tab = d.tab; render(); window.scrollTo(0, 0); return; }
   if (d.axis) { st.axis = d.axis; render(); return; }
   if (d.unit) { st.unit = d.unit; try { localStorage.setItem('poz_unit', d.unit); } catch (e) {} render(); return; }
+  if (d.res) { RES = d.res === '0.001' ? 0.001 : 0.005; try { localStorage.setItem('poz_res', String(RES)); } catch (e) {} if (st.connected) send(RES === 0.001 ? 'H' : 'G'); render(); return; }
   if (d.win) { send({ 1: '1', 5: '5', 10: '0', 30: '3' }[d.win]); if (st.s) st.s.win = +d.win; render(); return; }
   if (d.waxis) { wiz.axis = d.waxis; wiz.h = $('#wh').value; wiz.L = $('#wl').value; renderWiz(); return; }
   switch (d.act) {
