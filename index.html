@@ -65,6 +65,7 @@ nav button.on{color:var(--accent);font-weight:600}
 .toast{position:fixed;left:16px;right:16px;bottom:calc(env(safe-area-inset-bottom) + 84px);max-width:448px;margin:0 auto;background:#2A3138;color:var(--text);border-radius:12px;padding:12px 14px;font-size:14px;box-shadow:0 6px 24px rgba(0,0,0,.4);z-index:30}
 .sheet{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:flex-end;justify-content:center;z-index:20}
 .sheet>div{background:var(--bg);border:1px solid var(--line);border-radius:20px 20px 0 0;width:100%;max-width:480px;padding:18px 16px calc(env(safe-area-inset-bottom) + 18px);display:flex;flex-direction:column;gap:12px;max-height:92vh;overflow:auto}
+.sheet>div>*{flex-shrink:0}
 .steps{display:flex;gap:6px}
 .steps span{flex:1;height:6px;border-radius:3px;background:var(--line)}
 .steps span.on{background:var(--accent)}
@@ -83,21 +84,25 @@ input[type=checkbox]{width:22px;height:22px;margin:0;accent-color:var(--accent)}
 
 <script id="core">
 // ===== logika serii i formatowanie (bez Bluetooth i ekranu) =====
-const DRIFT_LIMIT = 0.010, DIFF_LIMIT = 0.010;
+let DRIFT_LIMIT = 0.010, DIFF_LIMIT = 0.010;   // = polowa tolerancji (setLimits)
+function setLimits(v) { DRIFT_LIMIT = DIFF_LIMIT = v; }
 
 function parseP(line) {             // P,nr,t,x,y,temp,stab,kier
   const a = line.split(',');
   if (a.length < 7) return null;
   return { idx: +a[1], t: +a[2], x: +a[3], y: +a[4], temp: +a[5], stab: +a[6], dir: a[7] || 'T' };
 }
-function parseS(line) {             // S,t,x,y,temp,gotowe,niep,V,okno,powrot,nast,ntam,karta,koniec
+function parseS(line) {             // S,t,x,y,temp,gotowe,niep,V,okno,powrot,nast,ntam,karta,koniec,spokojne,potrzebne,wstrzas
   const a = line.split(',');
   return { t: +a[1], x: +a[2], y: +a[3], temp: +a[4], stable: a[5] === '1', spread: +a[6], volt: +a[7],
-           win: +a[8], ret: a[9] === '1', next: +a[10], nTam: +a[11], sd: +a[12], done: a[13] === '1' };
+           win: +a[8], ret: a[9] === '1', next: +a[10], nTam: +a[11], sd: +a[12], done: a[13] === '1',
+           prog: a.length > 14 ? +a[14] : NaN, need: a.length > 15 ? +a[15] : NaN, shock: a[16] === '1',
+           pct: a.length > 17 ? +a[17] : -1, chg: a[18] === '1', rel: a[19] === '1', rssi: a.length > 20 ? +a[20] : 0 };
 }
-function parseI(line) {             // I,fw,zx,zy,kx,ky,zt,ktx,kty,dzwiek,karta,plik,okno,krok_um
+function parseI(line) {             // I,fw,zx,zy,kx,ky,zt,ktx,kty,dzwiek,karta,plik,okno,krok_um,okno_pkt,filtr
   const a = line.split(',');
-  return { res: +a[13] || 5, fw: a[1], zx: +a[2], zy: +a[3], kx: +a[4], ky: +a[5], zt: +a[6], ktx: +a[7], kty: +a[8],
+  return { res: +a[13] || 5, pw: +a[14] || 10, vib: a[15] === '1',
+           rx: +a[16] || 0, ry: +a[17] || 0, relSet: a[18] === '1', relOn: a[19] === '1', lim: +a[20] || 0.01, fw: a[1], zx: +a[2], zy: +a[3], kx: +a[4], ky: +a[5], zt: +a[6], ktx: +a[7], kty: +a[8],
            sound: a[9] === '1', sd: +a[10], file: a[11], win: +a[12] };
 }
 
@@ -179,6 +184,25 @@ function calcABA(a1, b, a2) {
   };
 }
 
+// kalibracja zera z kilku cykli A-B-A-B-A...: kazde B z odczytami A przed i po nim
+function calcABAmulti(r) {
+  const cyc = [];
+  for (let j = 1; j + 1 < r.length; j += 2) cyc.push(calcABA(r[j - 1], r[j], r[j + 1]));
+  if (!cyc.length) return null;
+  const n = cyc.length, ax = ['x', 'y'];
+  const mean = f => ({ x: cyc.reduce((s, c) => s + f(c).x, 0) / n, y: cyc.reduce((s, c) => s + f(c).y, 0) / n });
+  const zero = mean(c => c.zero), tilt = mean(c => c.tilt);
+  const sd = {}, u = {}, drift = {};
+  for (const k of ax) {
+    sd[k] = n > 1 ? Math.sqrt(cyc.reduce((s, c) => s + (c.zero[k] - zero[k]) ** 2, 0) / (n - 1)) : null;
+    drift[k] = r[r.length - 1][k] - r[0][k];
+    const d1 = Math.max(...cyc.map(c => Math.abs(c.drift[k])));
+    // niepewnosc zera: z rozrzutu cykli, a przy jednym cyklu z szumu odczytow i czesci dryftu, ktorej korekta liniowa moze nie usunac
+    u[k] = n > 1 ? Math.max(0.002, sd[k] / Math.sqrt(n)) : Math.sqrt(0.0035 ** 2 + (0.25 * d1) ** 2);
+  }
+  return { n, zero, tilt, sd, u, drift, cycles: cyc };
+}
+
 // kalibracja czulosci: h [mm] pod jednym koncem, L [mm] rozstaw podparc
 function calcSens(a1, b, a2, axis, h, L, kOld) {
   const f = a2.t !== a1.t ? (b.t - a1.t) / (a2.t - a1.t) : 0.5;
@@ -231,12 +255,12 @@ function seriesCsv(res, points) {
   for (const p of points) L.push(['P' + p.idx, p.dir, p.t, n(p.x), n(p.y), n(p.temp), n(p.stab)].join(';'));
   return L.join('\r\n') + '\r\n';
 }
-if (typeof module !== 'undefined') module.exports = { hyst, setRes: v => { RES = v; }, parseP, parseS, parseI, analyze, calcABA, calcSens, fmt, seriesCsv, niceScale };
+if (typeof module !== 'undefined') module.exports = { setLimits, calcABAmulti, hyst, setRes: v => { RES = v; }, parseP, parseS, parseI, analyze, calcABA, calcSens, fmt, seriesCsv, niceScale };
 </script>
 
 <script>
-const APP_VERSION = '04.4';
-const FW_MIN = '04.4';             // wersja programu poziomicy, z ktora ta aplikacja dziala w pelni
+const APP_VERSION = '04.8';
+const FW_MIN = '04.8';             // wersja programu poziomicy, z ktora ta aplikacja dziala w pelni
 // ===== Bluetooth (Nordic UART) =====
 const NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
@@ -248,6 +272,38 @@ const st = {
   tab: 'pomiar', unit: 'mmm', axis: 'x', showT: true,
   buf: '', dl: null, qWait: null, toastTimer: null
 };
+st.view = 'vial'; st.tol = 0.02; st.div = 'auto'; st.phoneSound = true;
+try {
+  st.view = localStorage.getItem('poz_view') || 'vial';
+  st.tol = parseFloat(localStorage.getItem('poz_tol')) || 0.02;
+  st.div = localStorage.getItem('poz_div') || 'auto';
+  st.phoneSound = localStorage.getItem('poz_psnd') !== '0';
+} catch (e) {}
+setLimits(st.tol / 2);
+function saveLocal(k, v) { try { localStorage.setItem(k, String(v)); } catch (e) {} }
+
+// ===== dzwiek w telefonie (Web Audio; dziala po pierwszym dotknieciu ekranu) =====
+let actx = null;
+function unlockAudio() {
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+  } catch (e) {}
+}
+function phoneBeep(freq = 2200, ms = 120, count = 1) {
+  if (!st.phoneSound || !actx) return;
+  try {
+    let t = actx.currentTime + 0.01;
+    for (let i = 0; i < count; i++) {
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.frequency.value = freq; o.type = 'square';
+      g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
+      g.gain.setValueAtTime(0.25, t + ms / 1000 - 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+      o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t + ms / 1000 + 0.02);
+      t += ms / 1000 + 0.09;
+    }
+  } catch (e) {}
+}
 try { st.unit = localStorage.getItem('poz_unit') || 'mmm'; RES = localStorage.getItem('poz_res') === '0.001' ? 0.001 : 0.005; } catch (e) {}
 
 let writeChain = Promise.resolve();
@@ -269,7 +325,7 @@ async function setupGatt(dev) {
   await tx.startNotifications();
   st.connected = true; st.points = []; st.buf = ''; st.dl = null;
   writeChain = Promise.resolve();
-  await send(RES === 0.001 ? 'H' : 'G'); await send('i'); await send('L');
+  await send(RES === 0.001 ? 'H' : 'G'); await send(`T${st.tol.toFixed(4)}\n`); await send('i'); st.listing = true; await send('L');
   wakeOn();
 }
 
@@ -338,7 +394,9 @@ function onLine(line) {
   if (!line) return;
   const c = line[0];
   if (line.startsWith('S,')) {
+    const was = st.s ? st.s.stable : null;
     st.s = parseS(line);
+    if (was === false && st.s.stable) phoneBeep(2600, 90);
     st.tempHist.push({ t: Date.now(), T: st.s.temp });
     while (st.tempHist.length && Date.now() - st.tempHist[0].t > 20 * 60000) st.tempHist.shift();
     renderLive();
@@ -349,16 +407,25 @@ function onLine(line) {
   }
   else if (line.startsWith('P,')) {
     const p = parseP(line);
-    if (p && !st.points.some(q => q.idx === p.idx && q.dir === p.dir && q.t === p.t)) st.points.push(p);
+    if (p && !st.points.some(q => q.idx === p.idx && q.dir === p.dir && q.t === p.t)) {
+      st.points.push(p);
+      if (!st.listing) {
+        if (p.dir === 'E' || (p.dir === 'W' && p.idx === 0)) phoneBeep(1800, 450);   // koniec serii
+        else phoneBeep(2200, 150);
+      }
+    }
     render();
   } else if (line.startsWith('Q,')) {
     const w = st.qWait; st.qWait = null;
-    if (w) { clearTimeout(w.timer); if (line === 'Q,ERR') w.reject(new Error('niestabilny')); else { const a = line.split(','); w.resolve({ t: +a[1], x: +a[2], y: +a[3], temp: +a[4], stab: +a[5] }); } }
+    if (w) { clearTimeout(w.timer); if (line === 'Q,ERR') { phoneBeep(900, 70, 2); w.reject(new Error('niestabilny')); } else { phoneBeep(2200, 150); const a = line.split(','); w.resolve({ t: +a[1], x: +a[2], y: +a[3], temp: +a[4], stab: +a[5] }); } }
   } else if (line.startsWith('#BEGIN')) {
     const a = line.split(' ');
     st.dl = { name: a[1] || 'plik.csv', size: +a[2] || 0, data: '' };
     updateDl();
   } else if (line.startsWith('# nowa seria') || line.startsWith('# lista punktow')) { st.points = []; render(); }
+  else if (line.startsWith('# lista koniec')) st.listing = false;
+  else if (line.startsWith('# odczyt niestabilny')) { phoneBeep(900, 70, 2); toast('Odczyt niestabilny – poczekaj na GOTOWE'); }
+  else if (line.startsWith('# UWAGA')) { phoneBeep(1200, 250, 3); toast(line.slice(2)); }
   else if (line.startsWith('#ERR')) toast({ 'zero': 'Poziomica nie zapisała zera – wgraj program ' + FW_MIN + ' lub nowszy', 'czulosc': 'Poziomica nie zapisała czułości', 'brak karty': 'Brak karty SD w poziomicy', 'brak pliku': 'Brak pliku na karcie' }[line.slice(5)] || line.slice(5));
   else if (line.startsWith('# BT')) { /* informacja diagnostyczna z poziomicy */ }
   else if (c === '#' && /UWAGA|niestabilny|zapisan|skasowan|powrot|za malo|zakonczona/.test(line)) toast(line.slice(2));
@@ -414,15 +481,26 @@ function render() {
   lastRender = Date.now();
 }
 function renderLive() {
-  if (st.tab !== 'seria' || Date.now() - lastRender > 5000) render();
-  if (wiz) updateWizButton();
+  const typing = document.activeElement && document.activeElement.tagName === 'INPUT' && document.activeElement.type !== 'checkbox' && $('#app').contains(document.activeElement);
+  if (!typing && (st.tab !== 'seria' || Date.now() - lastRender > 5000)) render();
+  if (wiz) { wizAuto(); updateWizButton(); }
 }
 
+function battTxt(s) {              // np. "78 %" albo "78 % ⚡"; bez akumulatora samo napiecie
+  if (!(s.pct >= 0)) return num(s.volt, 2) + ' V';
+  return s.pct + ' %' + (s.chg ? ' ⚡' : '');
+}
+function sigBars(r) {              // sila sygnalu jako 4 kreski
+  const n = !r ? 0 : r >= -60 ? 4 : r >= -70 ? 3 : r >= -80 ? 2 : 1;
+  let g = '';
+  for (let i = 0; i < 4; i++) g += `<rect x="${i * 4}" y="${9 - i * 3}" width="3" height="${3 + i * 3}" rx="1" fill="${i < n ? 'currentColor' : '#3A434C'}"/>`;
+  return `<svg width="15" height="12" viewBox="0 0 15 12" role="img" aria-label="sygnał ${r || '?'} dBm">${g}</svg>`;
+}
 function connPill() {
   if (st.reconnecting) return `<div class="pill"><span class="dot" style="background:var(--warn)"></span><span>Łączę ponownie…</span></div>`;
   if (!st.connected) return `<button class="btn sm acc" data-act="connect" ${st.connecting ? 'disabled' : ''}>${st.connecting ? 'Łączę…' : 'Połącz'}</button>`;
-  const v = st.s ? num(st.s.volt, 2) + ' V' : '…';
-  return `<div class="pill"><span class="dot" style="background:var(--ok)"></span><span>Połączono</span><span style="color:var(--faint)">·</span><span class="mono">${v}</span></div>`;
+  const v = st.s ? battTxt(st.s) : '…';
+  return `<div class="pill"><span class="dot" style="background:var(--ok)"></span><span>Połączono</span><span style="color:var(--faint)">·</span><span class="mono">${v}</span>${st.s ? sigBars(st.s.rssi) : ''}</div>`;
 }
 
 function band() {
@@ -430,30 +508,93 @@ function band() {
   if (st.reconnecting) return `<div class="band wait"><span class="big" style="font-size:17px;letter-spacing:0">Łączę ponownie…</span><small>zerwane połączenie</small></div>`;
   if (!st.connected) return `<div class="band off"><span class="big" style="font-size:17px;letter-spacing:0">Brak połączenia</span><small>naciśnij Połącz</small></div>`;
   if (!s) return `<div class="band off"><span class="big" style="font-size:17px;letter-spacing:0">Czekam na dane…</span></div>`;
-  const info = `stabilność ±${s.spread >= 0 ? num(s.spread, 3) : '–'}<br>okno ${s.win} s`;
-  return s.stable
-    ? `<div class="band ready"><div class="row" style="gap:10px">${ICON.ok}<span class="big">GOTOWE</span></div><small>${info}</small></div>`
-    : `<div class="band wait"><span class="big">czekaj</span><small>${info}</small></div>`;
+  const pw = st.info ? st.info.pw : 10;
+  const info = `stabilność ±${s.spread >= 0 ? num(s.spread, 3) : '–'}<br>punkt z ${pw} s${pw > 10 ? ' (precyzyjny)' : ''}`;
+  if (s.stable) return `<div class="band ready"><div class="row" style="gap:10px">${ICON.ok}<span class="big">GOTOWE</span></div><small>${info}</small></div>`;
+  if (s.shock) return `<div class="band wait"><span class="big">wstrząs</span><small>drgania podłoża<br>odczyt pominięty</small></div>`;
+  const need = s.need > 0 ? s.need : 8, prog = isNaN(s.prog) ? 0 : Math.min(s.prog, need);
+  const label = prog >= need ? 'czekaj · dryf' : `stabilizacja ${prog}/${need} s`;
+  return `<div class="band wait" style="flex-direction:column;align-items:stretch;gap:8px"><div class="row"><span class="big" style="font-size:18px;letter-spacing:0">${label}</span><small>${info}</small></div>
+<div style="height:6px;border-radius:3px;background:var(--line)"><div style="height:6px;border-radius:3px;background:var(--warn);width:${Math.round(prog / need * 100)}%"></div></div></div>`;
 }
 
-function libella() {
-  const s = st.s, x = s ? s.x : 0, y = s ? s.y : 0;
-  const S = niceScale(Math.max(Math.abs(x), Math.abs(y)) * 1.15, [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50]);
-  const R = 100, cx = 115, cy = 115;
-  const clamp = v => Math.max(-1, Math.min(1, v / S));
-  const px = cx + clamp(x) * R, py = cy - clamp(y) * R;
-  const tol = 0.02 / S * R;
-  return `<div class="card" style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:14px">
-<svg width="196" height="196" viewBox="0 0 230 230" role="img" aria-label="Libella: przechył X i Y">
-<circle cx="115" cy="115" r="108" fill="#12161A" stroke="#2A3138" stroke-width="2"/>
-<circle cx="115" cy="115" r="${R * 2 / 3}" fill="none" stroke="#2A3138" stroke-width="1.5"/>
-<circle cx="115" cy="115" r="${R / 3}" fill="none" stroke="#3A434C" stroke-width="1.5"/>
-<line x1="7" y1="115" x2="223" y2="115" stroke="#2A3138" stroke-width="1.5"/><line x1="115" y1="7" x2="115" y2="223" stroke="#2A3138" stroke-width="1.5"/>
-${tol >= 4 ? `<circle cx="115" cy="115" r="${tol}" fill="none" stroke="#F2C230" stroke-width="2" stroke-dasharray="3 3"/>` : ''}
-${s ? `<circle cx="${px}" cy="${py}" r="11" fill="#F2C230"/>` : ''}
-<text x="219" y="110" fill="#6E7881" font-size="11" text-anchor="end" font-family="IBM Plex Mono">X+</text><text x="121" y="20" fill="#6E7881" font-size="11" font-family="IBM Plex Mono">Y+</text>
-</svg>
-<div style="font-size:12px;color:var(--muted)">pełna skala: <span class="mono" style="color:var(--text)">±${fmt(S, st.unit, false)} ${UNITS[st.unit].l}</span>${tol >= 4 ? ' · przerywany okrąg: ±' + fmt(0.02, st.unit, false) : ''}</div></div>`;
+// ---- widok przechylu: ampulki / kwadrat ----
+const DIVS = [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5];
+function divFor(range) {               // dzialka: reczna albo auto (odczyt miesci sie w zakresie)
+  if (st.div !== 'auto') return +st.div;
+  const s = st.s, m = s ? Math.max(Math.abs(s.x), Math.abs(s.y), st.tol) : st.tol;
+  for (const d of DIVS) if (m <= range * 0.8 * d) return d;
+  return DIVS[DIVS.length - 1];
+}
+const lbl = (v, sign = true) => fmt(v, st.unit, sign).replace(/^\+0$/, '0');
+function hVial(val, div) {            // pozioma ampulka X: 20 dzialek, 15 px
+  const c = 163, px = 15, tolPx = Math.min(st.tol / div * px, 150);
+  let g = `<rect x="1" y="1" width="324" height="40" rx="20" fill="#12161A" stroke="#3A434C" stroke-width="2"/>
+<rect x="${c - tolPx}" y="3" width="${2 * tolPx}" height="36" fill="#F2C230" fill-opacity="0.14"/>
+<line x1="${c - tolPx}" y1="3" x2="${c - tolPx}" y2="39" stroke="#F2C230" stroke-width="1.5" stroke-dasharray="3 3"/><line x1="${c + tolPx}" y1="3" x2="${c + tolPx}" y2="39" stroke="#F2C230" stroke-width="1.5" stroke-dasharray="3 3"/>`;
+  for (let i = -10; i <= 10; i++) { const x = c + i * px, big = i % 5 === 0; g += `<line x1="${x}" y1="${big ? 29 : 34}" x2="${x}" y2="41" stroke="${big ? '#9AA4AD' : '#4A545D'}" stroke-width="${i === 0 ? 2 : 1.5}"/>`; }
+  const out = Math.abs(val / div) > 10.5, bx = c + Math.max(-10.5, Math.min(10.5, val / div)) * px;
+  g += `<rect x="${bx - 17}" y="9" width="34" height="22" rx="11" fill="${out ? '#F59E0B' : '#F2C230'}"/><line x1="${bx}" y1="12" x2="${bx}" y2="28" stroke="#1A1400" stroke-width="2"/>`;
+  [[-10, 'start'], [-5, 'middle'], [0, 'middle'], [5, 'middle'], [10, 'end']].forEach(([i, a]) => { g += `<text x="${c + i * px}" y="57" fill="#9AA4AD" font-size="11" text-anchor="${a}" font-family="IBM Plex Mono">${i === 0 ? '0' : lbl(i * div)}</text>`; });
+  return `<svg width="100%" viewBox="0 0 326 62" role="img" aria-label="Ampułka X">${g}</svg>`;
+}
+function vVial(val, div) {            // pionowa ampulka Y: 20 dzialek, 12 px, plus u gory
+  const c = 133, px = 12, tolPx = Math.min(st.tol / div * px, 120);
+  let g = `<rect x="1" y="1" width="40" height="264" rx="20" fill="#12161A" stroke="#3A434C" stroke-width="2"/>
+<rect x="3" y="${c - tolPx}" width="36" height="${2 * tolPx}" fill="#F2C230" fill-opacity="0.14"/>
+<line x1="3" y1="${c - tolPx}" x2="39" y2="${c - tolPx}" stroke="#F2C230" stroke-width="1.5" stroke-dasharray="3 3"/><line x1="3" y1="${c + tolPx}" x2="39" y2="${c + tolPx}" stroke="#F2C230" stroke-width="1.5" stroke-dasharray="3 3"/>`;
+  for (let i = -10; i <= 10; i++) { const y = c + i * px, big = i % 5 === 0; g += `<line x1="${big ? 29 : 34}" y1="${y}" x2="41" y2="${y}" stroke="${big ? '#9AA4AD' : '#4A545D'}" stroke-width="${i === 0 ? 2 : 1.5}"/>`; }
+  const out = Math.abs(val / div) > 10.5, by = c - Math.max(-10.5, Math.min(10.5, val / div)) * px;
+  g += `<rect x="9" y="${by - 17}" width="22" height="34" rx="11" fill="${out ? '#F59E0B' : '#F2C230'}"/><line x1="12" y1="${by}" x2="28" y2="${by}" stroke="#1A1400" stroke-width="2"/>`;
+  [[-10, 8], [-5, 4], [0, 4], [5, 4], [10, 0]].forEach(([i, dy]) => { g += `<text x="48" y="${c + i * px + dy}" fill="#9AA4AD" font-size="11" font-family="IBM Plex Mono">${i === 0 ? '0' : lbl(-i * div)}</text>`; });
+  return `<svg width="96" height="266" viewBox="0 0 96 266" role="img" aria-label="Ampułka Y">${g}</svg>`;
+}
+function squareView(x, y, div) {      // kwadrat: 10 kratek, zakres +-5 dzialek
+  const N = 280, c = 140, p = N / 2 / (5 * div), t = Math.min(st.tol * p, 138);
+  let g = `<rect x="1" y="1" width="278" height="278" rx="10" fill="#12161A" stroke="#3A434C" stroke-width="2"/>`;
+  for (let i = 1; i < 10; i++) { const v = i * 28, mid = i === 5; g += `<line x1="${v}" y1="2" x2="${v}" y2="278" stroke="${mid ? '#3A434C' : '#232A31'}" stroke-width="${mid ? 1.5 : 1}"/><line x1="2" y1="${v}" x2="278" y2="${v}" stroke="${mid ? '#3A434C' : '#232A31'}" stroke-width="${mid ? 1.5 : 1}"/>`; }
+  g += `<rect x="${c - t}" y="${c - t}" width="${2 * t}" height="${2 * t}" fill="#F2C230" fill-opacity="0.10" stroke="#F2C230" stroke-width="2" stroke-dasharray="4 3"/>`;
+  const cl = v => Math.max(-138, Math.min(138, v)), out = Math.abs(x) > 5 * div || Math.abs(y) > 5 * div;
+  if (st.s) g += `<circle cx="${c + cl(x * p)}" cy="${c - cl(y * p)}" r="10" fill="${out ? '#F59E0B' : '#F2C230'}"/>`;
+  g += `<text x="272" y="133" fill="#6E7881" font-size="11" text-anchor="end" font-family="IBM Plex Mono">X+</text><text x="146" y="16" fill="#6E7881" font-size="11" font-family="IBM Plex Mono">Y+</text>
+<text x="196" y="272" fill="#6E7881" font-size="10" text-anchor="middle" font-family="IBM Plex Mono">${lbl(2 * div)}</text><text x="252" y="272" fill="#6E7881" font-size="10" text-anchor="middle" font-family="IBM Plex Mono">${lbl(4 * div)}</text>`;
+  return `<svg width="100%" style="max-width:300px" viewBox="0 0 280 280" role="img" aria-label="Pole przechyłu X/Y">${g}</svg>`;
+}
+function tiltCard() {
+  const s = st.s, live = st.connected && s, u = UNITS[st.unit].l;
+  const x = live ? s.x : 0, y = live ? s.y : 0;
+  const vx = live ? fmt(hyst('x', s.x), st.unit) : '–', vy = live ? fmt(hyst('y', s.y), st.unit) : '–';
+  const tolTxt = num(st.tol, 3);
+  const top = `<div class="row" style="gap:10px">
+<div class="seg" style="grid-template-columns:repeat(2,minmax(0,1fr));width:176px;padding:2px;gap:2px"><button data-view="vial" class="${st.view === 'vial' ? 'on' : ''}" style="height:34px;font-size:13px">Ampułki</button><button data-view="square" class="${st.view === 'square' ? 'on' : ''}" style="height:34px;font-size:13px">Kwadrat</button></div>
+<div class="row" style="gap:6px"><label for="tol" style="font-size:12px;color:var(--muted);font-weight:600">Tol. ±</label><input id="tol" type="text" inputmode="decimal" value="${tolTxt}" style="width:68px;height:34px;border-radius:8px;border:1px solid var(--accent);background:var(--deep);color:var(--text);font-family:var(--mono);font-size:14px;text-align:center"></div></div>`;
+  const divs = [['auto', 'auto'], ['0.005', '0,005'], ['0.01', '0,01'], ['0.02', '0,02'], ['0.05', '0,05'], ['0.1', '0,1']];
+  const segDiv = `<div class="seg" style="grid-template-columns:repeat(6,minmax(0,1fr));padding:2px;gap:2px">${divs.map(([v, l]) => `<button data-div="${v}" class="${st.div === v ? 'on' : ''}" style="height:32px;font-size:12px">${l}</button>`).join('')}</div>`;
+  let body, range;
+  if (st.view === 'square') {
+    const div = divFor(5); range = `1 kratka = ${num(div, 3)} mm/m · zakres ±${num(5 * div, 3)} · kwadrat = tolerancja ±${tolTxt}`;
+    body = `<div style="display:flex;justify-content:center">${squareView(x, y, div)}</div>
+<div class="grid3">
+ <div style="background:var(--deep);border:1px solid var(--line);border-radius:12px;padding:6px 10px"><div style="font-size:12px;color:var(--muted);font-weight:700">X ${u}</div><div class="mono" style="font-size:19px;font-weight:600">${vx}</div></div>
+ <div style="background:var(--deep);border:1px solid var(--line);border-radius:12px;padding:6px 10px"><div style="font-size:12px;color:var(--muted);font-weight:700">Y ${u}</div><div class="mono" style="font-size:19px;font-weight:600">${vy}</div></div>
+ <div style="background:var(--deep);border:1px solid var(--line);border-radius:12px;padding:6px 10px"><div style="font-size:12px;color:var(--muted);font-weight:700">Temp.</div><div class="mono" style="font-size:19px;font-weight:600">${live ? num(s.temp, 1) + '°' : '–'}</div></div>
+</div>`;
+  } else {
+    const div = divFor(10); range = `1 działka = ${num(div, 3)} mm/m · zakres ±${num(10 * div, 3)} · żółty pas = tolerancja ±${tolTxt}`;
+    body = `<div style="display:flex;gap:12px;align-items:stretch">
+${vVial(y, div)}
+<div style="flex:1 1 auto;min-width:0;display:flex;flex-direction:column;justify-content:space-between;padding:4px 0">
+ <div><div style="font-size:15px;font-weight:700;color:var(--muted)">Y</div><div><span class="mono" style="font-size:32px;font-weight:600;letter-spacing:-.5px">${vy}</span> <span style="font-size:12px;color:var(--muted)">${u}</span></div></div>
+ <div style="height:1px;background:var(--line)"></div>
+ <div><div style="font-size:15px;font-weight:700;color:var(--muted)">X</div><div><span class="mono" style="font-size:32px;font-weight:600;letter-spacing:-.5px">${vx}</span> <span style="font-size:12px;color:var(--muted)">${u}</span></div></div>
+ <div style="height:1px;background:var(--line)"></div>
+ <div class="row" style="align-items:baseline"><span style="font-size:13px;color:var(--muted);font-weight:600">Temp.</span><span class="mono" style="font-size:18px;font-weight:600">${live ? num(s.temp, 1) + ' °C' : '–'}</span></div>
+ <div class="mono dim" style="font-size:12px;text-align:right">${live ? tempTrend() : ''}</div>
+</div></div>
+${hVial(x, div)}`;
+  }
+  return `<div class="card" style="display:flex;flex-direction:column;gap:12px;padding:14px 15px">${top}${body}
+<div style="display:flex;flex-direction:column;gap:6px">${segDiv}<div style="font-size:12px;color:var(--muted)">${range}</div></div></div>`;
 }
 
 function tempTrend() {
@@ -467,8 +608,17 @@ function tempTrend() {
   return (d < 0 ? '−' : '+') + num(Math.abs(d), 2) + ' / ' + min + ' min';
 }
 
+function zeroSwitch() {
+  const I = st.info, s = st.s, rel = s ? s.rel : I ? I.relOn : false, can = st.connected && I && I.relSet;
+  return `<div style="display:flex;flex-direction:column;gap:4px">
+<div class="seg" style="grid-template-columns:repeat(2,minmax(0,1fr));padding:2px;gap:2px">
+ <button data-zmode="a" class="${rel ? '' : 'on'}" style="height:36px;font-size:13px" ${st.connected ? '' : 'disabled'}>Zero ABS · A-B-A</button>
+ <button data-zmode="e" class="${rel ? 'on' : ''}" style="height:36px;font-size:13px" ${can ? '' : 'disabled'}>Zero REL · Zeruj</button>
+</div>
+<div class="sub" style="font-size:12px">${rel ? 'względem położenia złapanego przyciskiem Zeruj' : 'względem prawdziwego poziomu (kalibracja A-B-A)'}${I && !I.relSet ? ' · REL: naciśnij Zeruj' : ''}</div></div>`;
+}
 function viewPomiar() {
-  const s = st.s, u = UNITS[st.unit].l;
+  const s = st.s;
   const live = st.connected && s;
   let main = '', second = '', cap = '';
   if (live) {
@@ -490,12 +640,8 @@ function viewPomiar() {
   const endOk = live && !s.ret && !s.done && s.nTam >= 2 && s.stable;
   return `<div class="row"><div class="h1">Poziomica</div>${connPill()}</div>
 ${band()}
-${libella()}
-<div class="grid2">
- <div class="card"><div class="lab">X</div><div class="val">${live ? fmt(hyst('x', s.x), st.unit) : '–'}</div><div class="sub" style="font-size:12px">${u}</div></div>
- <div class="card"><div class="lab">Y</div><div class="val">${live ? fmt(hyst('y', s.y), st.unit) : '–'}</div><div class="sub" style="font-size:12px">${u}</div></div>
-</div>
-<div class="card row" style="padding:10px 14px"><div class="lab">Temperatura</div><div class="row" style="gap:12px;align-items:baseline"><span class="mono" style="font-size:20px;font-weight:600">${live ? num(s.temp, 1) + ' °C' : '–'}</span><span class="mono dim" style="font-size:12px">${live ? tempTrend() : ''}</span></div></div>
+${zeroSwitch()}
+${tiltCard()}
 <div class="row" style="gap:10px">
  <button class="btn" style="flex:1 1 0" data-act="zero" ${live ? '' : 'disabled'}>Zeruj</button>
  ${main}
@@ -566,7 +712,7 @@ function viewSeria() {
 </div>
 ${n ? `<div class="card tbl"><div class="tr hd"><span>${k.toUpperCase()}</span><span>tam</span><span>powrót</span><span>średnia</span><span>różnica</span></div>${rows}</div>` : ''}
 <div class="row" style="gap:10px"><button class="btn pri" style="flex:1 1 0;height:48px;font-size:15px" data-act="csv" ${n ? '' : 'disabled'}>Eksport CSV</button><button class="btn" style="flex:1 1 0;height:48px" data-act="newser" ${st.connected ? '' : 'disabled'}>Nowa seria</button></div>
-<div class="sub" style="font-size:12px">Średnia: wynik po usunięciu dryftu (względem P0). Różnica: tam − powrót po usunięciu dryftu; czerwona = ponad 0,010 mm/m.</div>`;
+<div class="sub" style="font-size:12px">Średnia: wynik po usunięciu dryftu (względem P0). Różnica: tam − powrót po usunięciu dryftu; czerwona = ponad ${num(DIFF_LIMIT, 3)} mm/m (połowa tolerancji).</div>`;
 }
 
 function dateStr(t) {
@@ -578,22 +724,28 @@ function dateStr(t) {
 function viewUstawienia() {
   const s = st.s, I = st.info, c = st.connected;
   const win = s ? s.win : I ? I.win : 5;
-  const seg = (items, cur, attr) => `<div class="seg" style="grid-template-columns:repeat(${items.length},minmax(0,1fr))">${items.map(([v, l]) => `<button data-${attr}="${v}" class="${String(cur) === String(v) ? 'on' : ''}" ${attr === 'win' && !c ? 'disabled' : ''}>${l}</button>`).join('')}</div>`;
+  const seg = (items, cur, attr) => `<div class="seg" style="grid-template-columns:repeat(${items.length},minmax(0,1fr))">${items.map(([v, l]) => `<button data-${attr}="${v}" class="${String(cur) === String(v) ? 'on' : ''}" ${(attr === 'win' || attr === 'pw') && !c ? 'disabled' : ''}>${l}</button>`).join('')}</div>`;
   let zeroTxt = 'brak danych';
   if (I) zeroTxt = I.zt ? 'ostatnia: ' + dateStr(I.zt) : (I.zx || I.zy) ? 'zero z przycisku Zeruj (bez A-B-A)' : 'zero nieustawione';
   const kTxt = I ? `X ${num(I.kx, 4)} · Y ${num(I.ky, 4)}` + (I.ktx || I.kty ? ' · ostatnia: ' + dateStr(Math.max(I.ktx, I.kty)) : ' · nie kalibrowana') : 'brak danych';
   const sdTxt = !I ? '–' : I.sd === 0 ? 'brak karty' : I.file + (I.sd === 2 ? ' · zapis włączony' : ' · zapis wstrzymany');
   return `<div class="h1">Ustawienia</div>
-<div class="card row"><div><div style="font-size:15px;font-weight:600">Poziomica${I ? ' · V' + esc(I.fw) : ''}</div><div class="mono dim" style="font-size:12px">${s ? num(s.volt, 2) + ' V · ' + num(s.temp, 1) + ' °C' : c ? 'połączono' : 'niepołączona'}${st.drops ? ' · zerwań: ' + st.drops : ''}</div></div>
+<div class="card row"><div><div style="font-size:15px;font-weight:600">Poziomica${I ? ' · V' + esc(I.fw) : ''}</div><div class="mono dim" style="font-size:12px">${s ? battTxt(s) + ' · ' + num(s.volt, 2) + ' V' + (s.chg ? ' (ładowanie)' : '') + ' · ' + num(s.temp, 1) + ' °C' : c ? 'połączono' : 'niepołączona'}${s && s.rssi ? ' · sygnał ' + s.rssi + ' dBm' : ''}${st.drops ? ' · zerwań: ' + st.drops : ''}</div></div>
  ${c ? '<button class="btn sm" data-act="disconnect">Rozłącz</button>' : `<button class="btn sm acc" data-act="connect">Połącz</button>`}</div>
-<div style="display:flex;flex-direction:column;gap:6px"><div class="lab">Okno uśredniania</div>${seg([[1, '1 s'], [5, '5 s'], [10, '10 s'], [30, '30 s']], win, 'win')}</div>
+<div style="display:flex;flex-direction:column;gap:6px"><div class="lab">Okno uśredniania</div>${seg([[1, '1 s'], [5, '5 s'], [10, '10 s'], [30, '30 s']], win, 'win')}<div class="sub" style="font-size:12px">dotyczy wyświetlania na żywo; punkt serii ma własne uśrednianie poniżej</div></div>
 <div style="display:flex;flex-direction:column;gap:6px"><div class="lab">Jednostka</div>${seg([['mmm', 'mm/m'], ['umm', 'µm/m'], ['sec', '″ (sekundy)']], st.unit, 'unit')}</div>
 <div style="display:flex;flex-direction:column;gap:6px"><div class="lab">Rozdzielczość wyświetlania</div>${seg([['0.005', '0,005 mm/m'], ['0.001', '0,001 mm/m']], String(RES), 'res')}
 <div class="sub" style="font-size:12px">0,005 – do regulacji maszyny (szum ukryty) · 0,001 – do analizy serii. Obliczenia i pliki zawsze z pełną dokładnością.</div></div>
+<div style="display:flex;flex-direction:column;gap:6px"><div class="lab">Punkt pomiaru – uśrednianie</div>${seg([[10, '10 s (zwykły)'], [30, '30 s'], [60, '60 s']], I ? I.pw : 10, 'pw')}
+<div class="sub" style="font-size:12px">Tryb precyzyjny: dłużej czekasz na GOTOWE. Wg testu na szlifierce punkt ma ok. ±0,005 (10 s), ±0,005 (30 s), ±0,004 mm/m (60 s) – zysk niewielki, najbardziej przy drganiach.</div></div>
+<div class="card list">
+ <div class="li"><div><label for="vib" class="t">Filtr drgań</label><div class="d">sekundy ze wstrząsem (kroki, maszyny obok) nie wchodzą do średniej punktu</div></div><input id="vib" type="checkbox" data-act="vib" ${I && I.vib ? 'checked' : ''} ${c ? '' : 'disabled'}></div>
+ <div class="li"><div><label for="psnd" class="t">Dźwięk w telefonie</label><div class="d">GOTOWE, zapis punktu, koniec serii, błąd</div></div><input id="psnd" type="checkbox" data-act="psound" ${st.phoneSound ? 'checked' : ''}></div>
+</div>
 <div class="card list">
  <div class="li"><div><div class="t">Kalibracja zera A-B-A</div><div class="d">A → obrót 180° (B) → A; zero z korektą dryftu · ${zeroTxt}</div></div><button class="btn sm acc" data-act="aba" ${c ? '' : 'disabled'}>Start</button></div>
  <div class="li"><div><div class="t">Kalibracja czułości</div><div class="d">wałek lub płytka wzorcowa o znanej wysokości · ${kTxt}</div></div><button class="btn sm acc" data-act="sens" ${c ? '' : 'disabled'}>Start</button></div>
- <div class="li"><div><div class="t">Kasuj zero</div><div class="d">odczyt bez poprawki zera</div></div><button class="btn sm" data-act="clrzero" ${c ? '' : 'disabled'}>Kasuj</button></div>
+ <div class="li"><div><div class="t">Kasuj zero A-B-A</div><div class="d">zero bezwzględne wraca do 0 (zero REL zostaje)</div></div><button class="btn sm" data-act="clrzero" ${c ? '' : 'disabled'}>Kasuj</button></div>
 </div>
 <div class="card list">
  <div class="li"><div><div class="t">Karta SD</div><div class="d mono">${esc(sdTxt)}</div></div><div class="row" style="gap:6px"><button class="btn sm" data-act="dlprev" ${c && I && I.sd ? '' : 'disabled'}>Poprz.</button><button class="btn sm" data-act="dl" ${c && I && I.sd ? '' : 'disabled'}>Pobierz</button></div></div>
@@ -605,71 +757,106 @@ ${navigator.bluetooth ? '' : '<div class="warnbox">Ta przeglądarka nie obsługu
 
 // ===== kreatory kalibracji =====
 let wiz = null;
-const ABA_STEPS = [
-  ['A', 'Postaw poziomicę w pozycji A i obrysuj jej położenie (ołówek, taśma).'],
-  ['B', 'Obróć poziomicę o 180° i postaw dokładnie w tym samym miejscu.'],
-  ['A', 'Obróć z powrotem do pozycji A, w ten sam obrys.']
-];
-const SENS_STEPS = [
-  ['A', 'Poziomica na płycie bez podkładki.'],
-  ['B', 'Podłóż wałek / płytkę wzorcową pod jeden koniec bazy (wzdłuż wybranej osi).'],
-  ['A', 'Zdejmij podkładkę, poziomica w tym samym miejscu.']
-];
+const fineMM = (v, sign = true) => v === null || v === undefined || isNaN(v) ? '–' : (sign ? (v < 0 ? '−' : '+') : (v < 0 ? '−' : '')) + Math.abs(v).toFixed(3).replace('.', ',');
+const SENS_TXT = { A: 'Poziomica na płycie bez podkładki.', B: 'Podłóż wałek / płytkę wzorcową pod jeden koniec bazy (wzdłuż wybranej osi).', A2: 'Zdejmij podkładkę, poziomica w tym samym miejscu.' };
 function openWiz(type) {
-  wiz = { type, step: type === 'sens' ? -1 : 0, r: [], axis: 'x', h: '', L: '', res: null, busy: false, err: '' };
+  wiz = { type, phase: type === 'sens' ? 'setup' : 'read', r: [], axis: 'x', h: '', L: '', res: null, busy: false, err: '', auto: true, armed: false, inB: false };
   renderWiz();
 }
 function closeWiz() { wiz = null; $('#sheet').innerHTML = ''; }
+function wizNextLabel() { return wiz.r.length % 2 ? 'B' : 'A'; }
+function wizWantsReading() { return wiz.phase === 'read' && (wiz.type === 'aba' || wiz.r.length < 3); }
+// automatyczny odczyt: po pierwszym recznym - kiedy poziomica zostanie ruszona (brak GOTOWE) i znowu sie uspokoi
+function wizAuto() {
+  if (!wiz || !wiz.auto || !wizWantsReading() || wiz.busy || !st.s || wiz.r.length === 0) return;
+  if (!st.s.stable) wiz.armed = true;
+  else if (wiz.armed) { wiz.armed = false; wizRead(); }
+}
 function updateWizButton() {
   const b = document.querySelector('#sheet [data-act="wizread"]');
   if (b) b.disabled = !(st.s && st.s.stable) || wiz.busy;
   const g = document.querySelector('#sheet .wizstat');
   if (g) g.innerHTML = wizStat();
+  if (wiz && wiz.phase === 'verify') { const v = document.querySelector('#sheet .wizverify'); if (v) v.innerHTML = verifyBody(); }
 }
 function wizStat() {
   const s = st.s;
   if (!s) return 'brak danych';
-  return (s.stable ? '<span style="color:var(--ok);font-weight:700">GOTOWE</span>' : '<span style="color:var(--warn);font-weight:700">czekaj</span>') +
-    ` · X <span class="mono">${fmt(s.x, st.unit)}</span> · Y <span class="mono">${fmt(s.y, st.unit)}</span>`;
+  const need = s.need > 0 ? s.need : 8;
+  const state = s.stable ? '<span style="color:var(--ok);font-weight:700">GOTOWE</span>'
+    : `<span style="color:var(--warn);font-weight:700">${s.shock ? 'wstrząs' : 'stabilizacja ' + Math.min(s.prog || 0, need) + '/' + need + ' s'}</span>`;
+  return `${state} · X <span class="mono">${fineMM(s.x)}</span> · Y <span class="mono">${fineMM(s.y)}</span>`;
+}
+function verifyBody() {
+  const R = wiz.res, s = st.s, sg = wiz.inB ? -1 : 1;
+  if (!R || !s) return 'brak danych';
+  const ex = { x: sg * R.tilt.x, y: sg * R.tilt.y }, dx = s.x - ex.x, dy = s.y - ex.y;
+  const ok = Math.abs(dx) <= 0.01 && Math.abs(dy) <= 0.01;
+  return `<div class="li"><span>Oczekiwane (${wiz.inB ? 'B' : 'A'})</span><span class="mono">X ${fineMM(ex.x)} · Y ${fineMM(ex.y)}</span></div>
+<div class="li"><span>Teraz</span><span class="mono">X ${fineMM(s.x)} · Y ${fineMM(s.y)}</span></div>
+<div class="li"><span>Różnica</span><span class="mono" style="color:${ok ? 'var(--ok)' : 'var(--warn)'}">X ${fineMM(dx)} · Y ${fineMM(dy)}</span></div>
+<div class="sub" style="font-size:12px">${s.stable ? (ok ? 'Zgodne w granicach ±0,010 mm/m.' : 'Różnica ponad 0,010 – sprawdź ustawienie przy listwie albo powtórz kalibrację.') : 'Poczekaj na GOTOWE.'}</div>`;
+}
+function abaResultHtml() {
+  const R = wiz.res, I = st.info;
+  const tiltMax = Math.max(Math.abs(R.tilt.x), Math.abs(R.tilt.y)), uMax = Math.max(R.u.x, R.u.y);
+  const haveOld = I && (I.zt || I.zx || I.zy);
+  let warn = '';
+  if (uMax > 0.010) warn += `<div class="warnbox">Niepewność zera ±${fineMM(uMax, false)} mm/m – ${R.n < 2 ? 'obróć jeszcze raz (dodatkowy cykl) albo powtórz kalibrację' : 'cykle za bardzo się różnią, sprawdź podłoże i ustawienie przy listwie'}.</div>`;
+  if (tiltMax > 0.5) warn += `<div class="warnbox">Podłoże pochylone o ${fineMM(tiltMax, false)} mm/m. Gdy obrót nie jest dokładnie o 180°, część pochylenia przechodzi na drugą oś – dosuwaj bazę do listwy / kątownika albo wypoziomuj podłoże.</div>`;
+  return `<div style="font-size:18px;font-weight:700">Wynik · ${R.n} ${R.n === 1 ? 'cykl' : R.n < 5 ? 'cykle' : 'cykli'}</div>
+<div class="card list">
+<div class="li"><span>Zero czujnika</span><span class="mono">X ${fineMM(R.zero.x)} · Y ${fineMM(R.zero.y)}</span></div>
+<div class="li"><span>Niepewność zera</span><span class="mono">X ±${fineMM(R.u.x, false)} · Y ±${fineMM(R.u.y, false)}</span></div>
+${R.n > 1 ? `<div class="li"><span>Rozrzut cykli</span><span class="mono">X ${fineMM(R.sd.x, false)} · Y ${fineMM(R.sd.y, false)}</span></div>` : ''}
+<div class="li"><span>Przechył podłoża</span><span class="mono">X ${fineMM(R.tilt.x)} · Y ${fineMM(R.tilt.y)}</span></div>
+<div class="li"><span>Dryft A→A</span><span class="mono">X ${fineMM(R.drift.x)} · Y ${fineMM(R.drift.y)}</span></div>
+${haveOld ? `<div class="li"><span>Zmiana wzgl. zapisanego</span><span class="mono">X ${fineMM(R.zero.x - I.zx)} · Y ${fineMM(R.zero.y - I.zy)}</span></div>` : ''}
+</div>${warn}
+<div class="sub" style="font-size:12px">Kolejny obrót (B, potem A) doda cykl – zero będzie średnią, a niepewność spadnie.</div>
+<button class="btn pri" data-act="wizsave">Zapisz zero w poziomicy</button>`;
 }
 function renderWiz() {
   if (!wiz) return;
-  const steps = wiz.type === 'aba' ? ABA_STEPS : SENS_STEPS;
   const title = wiz.type === 'aba' ? 'Kalibracja zera A-B-A' : 'Kalibracja czułości';
   let body = '';
-  if (wiz.step === -1) {
+  if (wiz.phase === 'setup') {
     body = `<div class="sub">Wybierz oś i podaj wymiary. Wałki: h = różnica średnic (np. Ø6 − Ø5) zmierzona mikrometrem.</div>
 <div class="seg" style="grid-template-columns:repeat(2,minmax(0,1fr))"><button data-waxis="x" class="${wiz.axis === 'x' ? 'on' : ''}">Oś X</button><button data-waxis="y" class="${wiz.axis === 'y' ? 'on' : ''}">Oś Y</button></div>
 <div class="grid2"><label class="f">h – wysokość podkładki [mm]<input type="number" inputmode="decimal" step="0.001" id="wh" value="${esc(wiz.h)}"></label>
 <label class="f">L – rozstaw podparć [mm]<input type="number" inputmode="decimal" step="0.1" id="wl" value="${esc(wiz.L)}"></label></div>
 <button class="btn pri" data-act="wizgo">Dalej</button>`;
-  } else if (wiz.step < 3) {
-    const [lbl, txt] = steps[wiz.step];
-    body = `<div class="steps">${[0, 1, 2].map(i => `<span class="${i < wiz.step ? 'done' : i === wiz.step ? 'on' : ''}"></span>`).join('')}</div>
-<div style="font-size:18px;font-weight:700">Krok ${wiz.step + 1}/3 · odczyt ${lbl}</div><div style="font-size:15px">${txt}</div>
-<div class="card wizstat" style="font-size:14px">${wizStat()}</div>
-${wiz.r.map((r, i) => `<div class="sub mono">${steps[i][0]}: X ${fmt(r.x, st.unit)} · Y ${fmt(r.y, st.unit)}</div>`).join('')}
-${wiz.err ? `<div class="warnbox">${esc(wiz.err)}</div>` : ''}
-<button class="btn pri" data-act="wizread">${wiz.busy ? 'Odczyt…' : 'Zapisz odczyt ' + lbl}</button>`;
+  } else if (wiz.phase === 'verify') {
+    body = `<div style="font-size:18px;font-weight:700">Sprawdzenie zera</div>
+<div class="sub">Postaw poziomicę w pozycji ${wiz.inB ? 'B (obróconej o 180°)' : 'A'}. Odczyt powinien być równy przechyłowi podłoża${wiz.inB ? ' ze zmienionym znakiem' : ''}.</div>
+<div class="seg" style="grid-template-columns:repeat(2,minmax(0,1fr))"><button data-verify="A" class="${wiz.inB ? '' : 'on'}">Jestem w A</button><button data-verify="B" class="${wiz.inB ? 'on' : ''}">Jestem w B</button></div>
+<div class="card list wizverify">${verifyBody()}</div>
+<button class="btn pri" data-act="wizclose">Zakończ</button>`;
   } else {
-    const R = wiz.res;
-    if (wiz.type === 'aba') {
-      const bad = Math.abs(R.drift.x) > 0.010 || Math.abs(R.drift.y) > 0.010;
-      body = `<div style="font-size:18px;font-weight:700">Wynik</div>
-<div class="card list"><div class="li"><span>Zero czujnika</span><span class="mono">X ${fmt(R.zero.x, st.unit)} · Y ${fmt(R.zero.y, st.unit)}</span></div>
-<div class="li"><span>Przechył podłoża</span><span class="mono">X ${fmt(R.tilt.x, st.unit)} · Y ${fmt(R.tilt.y, st.unit)}</span></div>
-<div class="li"><span>Dryft A→A</span><span class="mono">X ${fmt(R.drift.x, st.unit)} · Y ${fmt(R.drift.y, st.unit)}</span></div></div>
-${bad ? '<div class="warnbox">Dryft ponad 0,010 mm/m – lepiej powtórzyć kalibrację.</div>' : ''}
-<button class="btn pri" data-act="wizsave">Zapisz zero w poziomicy</button>`;
-    } else {
-      body = `<div style="font-size:18px;font-weight:700">Wynik · oś ${wiz.axis.toUpperCase()}</div>
-<div class="card list"><div class="li"><span>Oczekiwany przechył</span><span class="mono">${fmt(R.expected, 'mmm', false)} mm/m</span></div>
-<div class="li"><span>Zmierzony</span><span class="mono">${fmt(R.measured, 'mmm', false)} mm/m</span></div>
-<div class="li"><span>Dryft A→A</span><span class="mono">${fmt(R.drift, 'mmm')} mm/m</span></div>
+    const isAba = wiz.type === 'aba';
+    const n = wiz.r.length, lblNext = isAba ? wizNextLabel() : ['A', 'B', 'A'][Math.min(n, 2)];
+    const txt = isAba ? (lblNext === 'A' ? (n === 0 ? 'Postaw poziomicę w pozycji A, dosuniętą do listwy albo kątownika.' : 'Obróć z powrotem do pozycji A, do tej samej listwy.') : 'Obróć poziomicę o 180° i dosuń do tej samej listwy.')
+      : [SENS_TXT.A, SENS_TXT.B, SENS_TXT.A2][Math.min(n, 2)];
+    const done = isAba ? (n >= 3 && n % 2 === 1) : n >= 3;
+    const list = wiz.r.map((r, i) => `<div class="sub mono" style="font-size:12px">${isAba ? (i % 2 ? 'B' : 'A') : ['A', 'B', 'A'][i]}${i + 1}: X ${fineMM(r.x)} · Y ${fineMM(r.y)}</div>`).join('');
+    const readUi = wizWantsReading() ? `<div style="font-size:17px;font-weight:700">${done ? 'Dodatkowy cykl · ' : ''}odczyt ${lblNext}</div><div style="font-size:15px">${txt}</div>
+<div class="card wizstat" style="font-size:14px">${wizStat()}</div>
+<label style="display:flex;align-items:center;gap:8px;font-size:14px"><input type="checkbox" data-act="wizauto" ${wiz.auto ? 'checked' : ''}> Automatyczny odczyt po obróceniu i GOTOWE</label>
+${wiz.err ? `<div class="warnbox">${esc(wiz.err)}</div>` : ''}
+<button class="${done ? 'btn' : 'btn pri'}" data-act="wizread">${wiz.busy ? 'Odczyt…' : 'Zapisz odczyt ' + lblNext + (n === 0 ? '' : ' ręcznie')}</button>` : '';
+    let res = '';
+    if (done && isAba) res = abaResultHtml();
+    else if (done) {
+      const R = wiz.res;
+      res = `<div style="font-size:18px;font-weight:700">Wynik · oś ${wiz.axis.toUpperCase()}</div>
+<div class="card list"><div class="li"><span>Oczekiwany przechył</span><span class="mono">${fineMM(R.expected, false)} mm/m</span></div>
+<div class="li"><span>Zmierzony</span><span class="mono">${fineMM(R.measured, false)} mm/m</span></div>
+<div class="li"><span>Dryft A→A</span><span class="mono">${fineMM(R.drift)} mm/m</span></div>
 <div class="li"><span>Nowy współczynnik</span><span class="mono">${num(R.kNew, 5)}</span></div></div>
 ${R.ok ? '<div class="sub">Po zmianie czułości zrób ponownie kalibrację zera A-B-A.</div>' : '<div class="warnbox">Wynik poza zakresem 0,8–1,2 – sprawdź h, L i ułożenie podkładki.</div>'}
 <button class="btn pri" data-act="wizsave" ${R.ok ? '' : 'disabled'}>Zapisz w poziomicy</button>`;
     }
+    body = `${list}${res}${readUi}`;
   }
   $('#sheet').innerHTML = `<div class="sheet"><div><div class="row"><div class="h1" style="font-size:19px">${title}</div><button class="btn sm" data-act="wizclose">Zamknij</button></div>${body}</div></div>`;
   updateWizButton();
@@ -678,27 +865,43 @@ async function wizRead() {
   wiz.busy = true; wiz.err = ''; renderWiz();
   try {
     const r = await reading();
-    wiz.r.push(r); wiz.step++;
-    if (wiz.step === 3) {
+    wiz.r.push(r);
+    if (wiz.type === 'aba') wiz.res = calcABAmulti(wiz.r);
+    else if (wiz.r.length === 3) {
       const [a1, b, a2] = wiz.r;
-      wiz.res = wiz.type === 'aba' ? calcABA(a1, b, a2)
-        : calcSens(a1, b, a2, wiz.axis, wiz.h, wiz.L, wiz.axis === 'x' ? st.info.kx : st.info.ky);
+      wiz.res = calcSens(a1, b, a2, wiz.axis, wiz.h, wiz.L, wiz.axis === 'x' ? st.info.kx : st.info.ky);
     }
   } catch (e) { wiz.err = e.message === 'niestabilny' ? 'Odczyt niestabilny – poczekaj na GOTOWE.' : 'Brak odpowiedzi poziomicy.'; }
-  wiz.busy = false; renderWiz();
+  wiz.busy = false; wiz.armed = false; renderWiz();
 }
 async function wizSave() {
   const now = Math.floor(Date.now() / 1000);
-  if (wiz.type === 'aba') await send(`Z${wiz.res.zero.x.toFixed(5)},${wiz.res.zero.y.toFixed(5)},${now}\n`);
-  else await send(`K${wiz.axis.toUpperCase()},${wiz.res.kNew.toFixed(6)},${now}\n`);
-  closeWiz();
+  if (wiz.type === 'aba') {
+    await send(`Z${wiz.res.zero.x.toFixed(5)},${wiz.res.zero.y.toFixed(5)},${now}\n`);
+    wiz.phase = 'verify'; wiz.inB = false; renderWiz();
+  } else {
+    await send(`K${wiz.axis.toUpperCase()},${wiz.res.kNew.toFixed(6)},${now}\n`);
+    closeWiz();
+  }
 }
 
 // ===== obsluga klikniec =====
+document.addEventListener('change', ev => {
+  if (ev.target.id !== 'tol') return;
+  const v = parseFloat(String(ev.target.value).replace(',', '.'));
+  if (v >= 0.004 && v <= 1) { st.tol = v; saveLocal('poz_tol', v); setLimits(v / 2); if (st.connected) send(`T${v.toFixed(4)}\n`); } else toast('Podaj tolerancję od 0,004 do 1, np. 0,020');
+  ev.target.blur(); render();
+});
 document.addEventListener('click', async ev => {
+  unlockAudio();
   const t = ev.target.closest('button,input');
   if (!t) return;
   const d = t.dataset;
+  if (d.zmode) { send(d.zmode); if (st.s) st.s.rel = d.zmode === 'e'; if (st.info) st.info.relOn = d.zmode === 'e'; render(); return; }
+  if (d.view) { st.view = d.view; saveLocal('poz_view', d.view); render(); return; }
+  if (d.div) { st.div = d.div; saveLocal('poz_div', d.div); render(); return; }
+  if (d.pw) { send(`W${d.pw}\n`); if (st.info) st.info.pw = +d.pw; render(); return; }
+  if (d.verify) { wiz.inB = d.verify === 'B'; renderWiz(); return; }
   if (d.tab) { st.tab = d.tab; render(); window.scrollTo(0, 0); return; }
   if (d.axis) { st.axis = d.axis; render(); return; }
   if (d.unit) { st.unit = d.unit; try { localStorage.setItem('poz_unit', d.unit); } catch (e) {} render(); return; }
@@ -708,7 +911,7 @@ document.addEventListener('click', async ev => {
   switch (d.act) {
     case 'connect': connect(); break;
     case 'disconnect': disconnect(); break;
-    case 'zero': if (confirm('Wyzerować odczyt w bieżącym położeniu?\n(Dokładniejsze zero: Ustawienia → Kalibracja zera A-B-A)')) send('z'); break;
+    case 'zero': if (confirm('Ustawić zero względne (REL) w bieżącym położeniu?\nZero bezwzględne z kalibracji A-B-A zostaje bez zmian – wrócisz do niego przełącznikiem ABS.')) send('z'); break;
     case 'point': send('m'); break;
     case 'ret': send('w'); break;
     case 'end': send('k'); break;
@@ -720,6 +923,9 @@ document.addEventListener('click', async ev => {
     case 'dl': send('D'); toast('Pobieram plik z karty…'); break;
     case 'dlprev': send('E'); toast('Pobieram poprzedni plik…'); break;
     case 'sound': send('b'); break;
+    case 'vib': send(t.checked ? 'F1\n' : 'F0\n'); break;
+    case 'psound': st.phoneSound = t.checked; saveLocal('poz_psnd', t.checked ? 1 : 0); if (t.checked) phoneBeep(2200, 120); break;
+    case 'wizauto': wiz.auto = t.checked; wiz.armed = false; break;
     case 'aba': openWiz('aba'); break;
     case 'sens': if (st.info) openWiz('sens'); else send('i'); break;
     case 'wizclose': closeWiz(); break;
@@ -729,7 +935,7 @@ document.addEventListener('click', async ev => {
       wiz.h = $('#wh').value; wiz.L = $('#wl').value;
       const h = parseFloat(String(wiz.h).replace(',', '.')), L = parseFloat(String(wiz.L).replace(',', '.'));
       if (!(h > 0) || !(L > 0) || h >= L) { toast('Podaj poprawne h i L'); break; }
-      wiz.h = h; wiz.L = L; wiz.step = 0; renderWiz(); break;
+      wiz.h = h; wiz.L = L; wiz.phase = 'read'; renderWiz(); break;
     }
   }
 });
