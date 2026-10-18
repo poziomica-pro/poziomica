@@ -259,7 +259,9 @@ if (typeof module !== 'undefined') module.exports = { setLimits, calcABAmulti, h
 </script>
 
 <script>
-const APP_VERSION = '04.8';
+const APP_VERSION = '04.10';
+// porownanie wersji liczbowo (04.10 jest nowsze niz 04.8)
+const fwOld = v => { const a = String(v).split('.').map(Number), b = FW_MIN.split('.').map(Number); return a[0] < b[0] || (a[0] === b[0] && (a[1] || 0) < b[1]); };
 const FW_MIN = '04.8';             // wersja programu poziomicy, z ktora ta aplikacja dziala w pelni
 // ===== Bluetooth (Nordic UART) =====
 const NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -402,7 +404,7 @@ function onLine(line) {
     renderLive();
   } else if (line.startsWith('I,')) {
     st.info = parseI(line);
-    if (st.info.fw < FW_MIN && !st.fwWarned) { st.fwWarned = true; toast('W poziomicy jest program ' + st.info.fw + ' – wgraj ' + FW_MIN + ', inaczej część funkcji nie zadziała'); }
+    if (fwOld(st.info.fw) && !st.fwWarned) { st.fwWarned = true; toast('W poziomicy jest program ' + st.info.fw + ' – wgraj ' + FW_MIN + ', inaczej część funkcji nie zadziała'); }
     render();
   }
   else if (line.startsWith('P,')) {
@@ -751,7 +753,7 @@ function viewUstawienia() {
  <div class="li"><div><div class="t">Karta SD</div><div class="d mono">${esc(sdTxt)}</div></div><div class="row" style="gap:6px"><button class="btn sm" data-act="dlprev" ${c && I && I.sd ? '' : 'disabled'}>Poprz.</button><button class="btn sm" data-act="dl" ${c && I && I.sd ? '' : 'disabled'}>Pobierz</button></div></div>
  <div class="li"><label for="snd" class="t">Dźwięk brzęczyka</label><input id="snd" type="checkbox" data-act="sound" ${I && I.sound ? 'checked' : ''} ${c ? '' : 'disabled'}></div>
 </div>
-<div class="sub" style="font-size:12px;text-align:center">aplikacja ${APP_VERSION}${I && I.fw < FW_MIN ? ` · <span style="color:var(--warn)">program poziomicy ${esc(I.fw)} – wgraj ${FW_MIN}</span>` : ''}</div>
+<div class="sub" style="font-size:12px;text-align:center">aplikacja ${APP_VERSION}${I && fwOld(I.fw) ? ` · <span style="color:var(--warn)">program poziomicy ${esc(I.fw)} – wgraj ${FW_MIN}</span>` : ''}</div>
 ${navigator.bluetooth ? '' : '<div class="warnbox">Ta przeglądarka nie obsługuje Bluetooth. Otwórz tę stronę w aplikacji Bluefy.</div>'}`;
 }
 
